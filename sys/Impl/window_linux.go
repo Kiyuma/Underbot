@@ -1,140 +1,148 @@
-// +build linux
+//go:build windows
+// +build windows
 
 package impl
 
 import (
+	"fmt"
 	"image"
+	"image/color"
+	"image/draw"
+	"syscall"
+	"unsafe"
 
-	"github.com/BurntSushi/xgb/xproto"
-	"github.com/BurntSushi/xgbutil/ewmh"
-	"github.com/BurntSushi/xgbutil/icccm"
-	"github.com/BurntSushi/xgbutil/xrect"
-	"github.com/BurntSushi/xgbutil/xwindow"
+	"golang.org/x/sys/windows"
 	"github.com/pkg/errors"
 )
 
-// window is an implementation of Window
+// window is a Windows implementation of Window
 type window struct {
-	parent Server          // The server in charge of the window
-	winID  xproto.Window   // The xproto ID of the window
-	xWinID *xwindow.Window // The xwindow ID of the window
+	parent Server   // The server in charge of the window
+	hwnd   syscall.Handle // Windows handle to the window
 }
 
-// Newwindow creates a new window instance
-func newWindow(x Server, winID xproto.Window) (window, error) {
-	// Create xwindow instance from xproto window id
-	xWinID := xwindow.New(x.conn, winID)
-
-	xWin := window{parent: x, winID: winID, xWinID: xWinID}
-	return xWin, xWin.check()
+// newWindow creates a new window instance
+func newWindow(x Server, hwnd syscall.Handle) (window, error) {
+	win := window{parent: x, hwnd: hwnd}
+	return win, win.check()
 }
 
-// check ensures that the window is valid
-func (xWin window) check() error {
-	err := xWin.parent.check()
-	if err != nil {
-		return errors.Wrap(err, "the parent server was invalid")
-	}
-	if xWin.winID == 0 {
-		return errors.New("window id is zero value")
-	}
-	if (xWin.xWinID == &xwindow.Window{}) {
-		return errors.New("xwindow is empty")
+// check ensures the window is valid
+func (w window) check() error {
+	if w.hwnd == 0 {
+		return errors.New("invalid window handle")
 	}
 	return nil
 }
 
-// Center finds the point in the middle of a xrect
-func (xWin window) Center() (point image.Point, err error) {
-	rect, err := xWin.rect()
-	if err != nil {
-		return image.Point{}, errors.Wrap(err, "failed to get the rectangle of the window")
+// rect gets the bounding rectangle of the window
+func (w window) rect() (windows.RECT, error) {
+	var r windows.RECT
+	ret := windows.GetWindowRect(w.hwnd, &r)
+	if ret != nil {
+		return r, errors.Wrap(ret, "failed to get window rect")
 	}
-	point.X = rect.X() + (rect.Width() / 2)
-	point.Y = rect.Y() + (rect.Height() / 2)
-	return point, nil
+	return r, nil
 }
 
-func (xWin window) rect() (xrect.Rect, error) {
-	// Get a rectangle describing the dimensions of the window for proper rendering in the case the resize fails silently
-	rect, err := xWin.xWinID.Geometry()
+// Center finds the point in the middle of the window
+func (w window) Center() (image.Point, error) {
+	r, err := w.rect()
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to get the rectangle of the window")
+		return image.Point{}, err
 	}
-	return rect, nil
-}
-
-// WxH gets the width and height of the window
-func (xWin window) WxH() (int, int, error) {
-	rect, err := xWin.rect()
-	if err != nil {
-		return 0, 0, errors.Wrap(err, "could not get the rectangle of the window")
-	}
-	return rect.Width(), rect.Height(), nil
-}
-
-// GetImage gets a screenshot of the window
-func (xWin window) GetImage() (image.RGBA, error) {
-	// Get rectangle of the window
-	rect, err := xWin.rect()
-	if err != nil {
-		return image.RGBA{}, errors.Wrap(err, "failed to get the rectangle of the window")
-	}
-
-	// Gets the image from the window
-	ximg, err := xproto.GetImage(
-		xWin.parent.conn.Conn(), xproto.ImageFormatZPixmap,
-		xproto.Drawable(xWin.winID), int16(0), int16(0),
-		uint16(rect.Width()), uint16(rect.Height()), 0xffffffff).Reply()
-	if err != nil {
-		return image.RGBA{}, errors.Wrap(err, "failed to get the image of the window")
-	}
-
-	// Converts the xproto image to an image.RGBA instance
-	data := ximg.Data
-	for i := 0; i < len(data); i += 4 {
-		data[i], data[i+2], data[i+3] = data[i+2], data[i], 255
-	}
-	return image.RGBA{
-		Pix:    data,
-		Stride: 4 * rect.Width(),
-		Rect:   image.Rect(0, 0, rect.Width(), rect.Height()),
+	return image.Point{
+		X: int((r.Left + r.Right) / 2),
+		Y: int((r.Top + r.Bottom) / 2),
 	}, nil
 }
 
-// Name gets the name of the window
-func (xWin window) Name() (string, error) {
-	// Get the title of the window
-	name, err := ewmh.WmNameGet(xWin.parent.conn, xWin.winID)
-	if err != nil || len(name) == 0 {
-		name, err = icccm.WmNameGet(xWin.parent.conn, xWin.winID)
-		if err != nil || len(name) == 0 {
-			return "", errors.Wrap(err, "failed to get the name of the window")
-		}
+// WxH gets the width and height of the window
+func (w window) WxH() (int, int, error) {
+	r, err := w.rect()
+	if err != nil {
+		return 0, 0, err
 	}
-	return name, nil
+	return int(r.Right - r.Left), int(r.Bottom - r.Top), nil
 }
 
-// Resize adjusts the height and width of the window
-func (xWin window) Resize(height, width int) error {
-	// Attempt to resize the window for WM compatible DEs
-	err := xWin.xWinID.WMResize(width, height)
+// GetImage captures a screenshot of the window
+func (w window) GetImage() (image.RGBA, error) {
+	r, err := w.rect()
 	if err != nil {
-		return errors.Wrap(err, "Could not resize window")
+		return image.RGBA{}, err
+	}
+	width := int(r.Right - r.Left)
+	height := int(r.Bottom - r.Top)
+
+	hdcWindow, err := windows.GetDC(w.hwnd)
+	if err != nil {
+		return image.RGBA{}, errors.Wrap(err, "GetDC failed")
+	}
+	defer windows.ReleaseDC(w.hwnd, hdcWindow)
+
+	hdcMem, err := windows.CreateCompatibleDC(hdcWindow)
+	if err != nil {
+		return image.RGBA{}, errors.Wrap(err, "CreateCompatibleDC failed")
+	}
+	defer windows.DeleteDC(hdcMem)
+
+	hbm, err := windows.CreateCompatibleBitmap(hdcWindow, int32(width), int32(height))
+	if err != nil {
+		return image.RGBA{}, errors.Wrap(err, "CreateCompatibleBitmap failed")
+	}
+	defer windows.DeleteObject(windows.HGDIOBJ(hbm))
+
+	old := windows.SelectObject(hdcMem, windows.HGDIOBJ(hbm))
+	defer windows.SelectObject(hdcMem, old)
+
+	if !windows.BitBlt(hdcMem, 0, 0, int32(width), int32(height), hdcWindow, 0, 0, windows.SRCCOPY) {
+		return image.RGBA{}, errors.New("BitBlt failed")
+	}
+
+	var bmi windows.BITMAPINFO
+	bmi.BmiHeader.Size = uint32(unsafe.Sizeof(bmi.BmiHeader))
+	bmi.BmiHeader.Width = int32(width)
+	bmi.BmiHeader.Height = -int32(height) // top-down DIB
+	bmi.BmiHeader.Planes = 1
+	bmi.BmiHeader.BitCount = 32
+	bmi.BmiHeader.Compression = windows.BI_RGB
+
+	buf := make([]byte, width*height*4)
+	if windows.GetDIBits(hdcMem, hbm, 0, uint32(height), unsafe.Pointer(&buf[0]), &bmi, windows.DIB_RGB_COLORS) == 0 {
+		return image.RGBA{}, errors.New("GetDIBits failed")
+	}
+
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	copy(img.Pix, buf)
+
+	return *img, nil
+}
+
+// Name gets the window title
+func (w window) Name() (string, error) {
+	buf := make([]uint16, 256)
+	n, err := windows.GetWindowText(w.hwnd, &buf[0], int32(len(buf)))
+	if err != nil {
+		return "", errors.Wrap(err, "GetWindowText failed")
+	}
+	return windows.UTF16ToString(buf[:n]), nil
+}
+
+// Resize adjusts the window size
+func (w window) Resize(height, width int) error {
+	return windows.SetWindowPos(w.hwnd, 0, 0, 0, int32(width), int32(height), windows.SWP_NOMOVE|windows.SWP_NOZORDER)
+}
+
+// SetActive brings the window to the foreground
+func (w window) SetActive() error {
+	if !windows.SetForegroundWindow(w.hwnd) {
+		return errors.New("failed to set foreground window")
 	}
 	return nil
 }
 
-// SetActive makes the window active, or puts the window into the foreground
-func (xWin window) SetActive() error {
-	err := ewmh.ActiveWindowReq(xWin.parent.conn, xWin.winID)
-	if err != nil {
-		return errors.Wrap(err, "failed to focus the window")
-	}
-	return nil
-}
-
-// SetActive makes the window active, or puts the window into the foreground
-func (xWin window) ID() (int, error) {
-	return int(xWin.winID), nil
+// ID returns the HWND as int
+func (w window) ID() (int, error) {
+	return int(w.hwnd), nil
 }
